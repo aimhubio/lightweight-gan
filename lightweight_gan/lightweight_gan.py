@@ -137,6 +137,16 @@ def dual_contrastive_loss(real_logits, fake_logits):
 def det_randn(*args):
     return torch.randn(*args)
 
+def interpolate_between(a, b, *, num_samples, dim):
+    assert num_samples > 2
+    samples = []
+    step_size = 0
+    for _ in range(num_samples):
+        sample = torch.lerp(a, b, step_size)
+        samples.append(sample)
+        step_size += 1 / (num_samples - 1)
+    return torch.stack(samples, dim=dim)
+
 # helper classes
 
 class NanException(Exception):
@@ -983,7 +993,7 @@ class Trainer():
     @property
     def checkpoint_num(self):
         return floor(self.steps // self.save_every)
-        
+
     def init_GAN(self):
         args, kwargs = self.GAN_params
 
@@ -1073,6 +1083,7 @@ class Trainer():
             print(f'autosetting augmentation probability to {round(self.aug_prob * 100)}%')
 
     def train(self):
+
         assert exists(self.loader), 'You must first initialize the data source with `.set_data_src(<folder of images>)`'
         device = torch.device(f'cuda:{self.rank}')
 
@@ -1203,7 +1214,7 @@ class Trainer():
 
             gen_loss.register_hook(raise_if_nan)
             self.G_scaler.scale(gen_loss).backward()
-            total_gen_loss += loss 
+            total_gen_loss += loss
 
         self.g_loss = float(total_gen_loss.item() / self.gradient_accumulate_every)
         self.G_scaler.step(self.GAN.G_opt)
@@ -1233,7 +1244,7 @@ class Trainer():
             if self.steps % self.save_every == 0:
                 self.save(self.checkpoint_num)
 
-            if self.steps % self.evaluate_every == 0 or (self.steps % 100 == 0 and self.steps < 20000):
+            if self.steps in set(int(1.2 ** i) for i in range(100)):
                 self.evaluate(floor(self.steps / self.evaluate_every), num_image_tiles = self.num_image_tiles)
 
             if exists(self.calculate_fid_every) and self.steps % self.calculate_fid_every == 0 and self.steps != 0:
@@ -1252,14 +1263,33 @@ class Trainer():
 
         ext = self.image_extension
         num_rows = num_image_tiles
-    
+
         latent_dim = self.GAN.latent_dim
         image_size = self.GAN.image_size
 
         # latents and noise
 
         latents = det_randn((num_rows ** 2, latent_dim)).cuda(self.rank)
+        interpolate_latents = interpolate_between(latents[:num_rows], latents[-num_rows:],
+                                                  num_samples=num_rows,
+                                                  dim=0).flatten(end_dim=1)
 
+        generate_interpolations = self.generate_(self.GAN.G, interpolate_latents)
+        if self.run is not None:
+            grouped = generate_interpolations.view(num_rows, num_rows, *generate_interpolations.shape[1:])
+            for idx, images in enumerate(grouped):
+                alpha = idx / (len(grouped) - 1)
+                aim_images = []
+                for image in images:
+                    ndarr = image.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to('cpu', torch.uint8).numpy()
+                    im = Image.fromarray(ndarr)
+                    aim_images.append(aim.Image(im, caption=f'#{idx}'))
+
+                self.run.track(value=aim_images, name='generated',
+                               step=self.steps,
+                               context={'interpolated': True,
+                                        'alpha': alpha})
+        torchvision.utils.save_image(generate_interpolations, str(self.results_dir / self.name / f'{str(num)}-interp.{ext}'), nrow=num_rows)
         # regular
 
         generated_images = self.generate_(self.GAN.G, latents)
@@ -1272,8 +1302,8 @@ class Trainer():
                 aim_images.append(aim.Image(im, caption=f'#{idx}'))
 
             self.run.track(value=aim_images, name='generated',
-                        step=self.steps,
-                        context={'ema': False})
+                           step=self.steps,
+                           context={'ema': False})
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}.{ext}'), nrow=num_rows)
 
         # moving averages
@@ -1287,8 +1317,8 @@ class Trainer():
                 aim_images.append(aim.Image(im, caption=f'EMA #{idx}'))
 
             self.run.track(value=aim_images, name='generated',
-                        step=self.steps,
-                        context={'ema': True})
+                           step=self.steps,
+                           context={'ema': True})
         torchvision.utils.save_image(generated_images, str(self.results_dir / self.name / f'{str(num)}-ema.{ext}'), nrow=num_rows)
 
     @torch.no_grad()
@@ -1425,11 +1455,11 @@ class Trainer():
             generated_images = self.generate_(self.GAN.GE, interp_latents)
             images_grid = torchvision.utils.make_grid(generated_images, nrow = num_rows)
             pil_image = transforms.ToPILImage()(images_grid.cpu())
-            
+
             if self.transparent:
                 background = Image.new('RGBA', pil_image.size, (255, 255, 255))
                 pil_image = Image.alpha_composite(background, pil_image)
-                
+
             frames.append(pil_image)
 
         frames[0].save(str(self.results_dir / self.name / f'{str(num)}.gif'), save_all=True, append_images=frames[1:], duration=80, loop=0, optimize=True)
